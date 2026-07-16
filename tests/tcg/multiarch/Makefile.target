@@ -47,6 +47,9 @@ munmap-pthread: LDFLAGS+=-pthread
 vma-pthread: CFLAGS+=-pthread
 vma-pthread: LDFLAGS+=-pthread
 
+linux-robust-mutex: CFLAGS+=-pthread
+linux-robust-mutex: LDFLAGS+=-pthread
+
 sigreturn-sigmask: CFLAGS+=-pthread
 sigreturn-sigmask: LDFLAGS+=-pthread
 
