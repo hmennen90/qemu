@@ -8290,6 +8290,133 @@ static int do_futex(CPUState *cpu, bool time64, target_ulong uaddr,
 }
 #endif
 
+/* Robust-futex control bits in the futex word; identical on every ABI. */
+#define TARGET_FUTEX_WAITERS    0x80000000U
+#define TARGET_FUTEX_OWNER_DIED 0x40000000U
+#define TARGET_FUTEX_TID_MASK   0x3fffffffU
+/* Same guard the kernel uses against a corrupt/looping guest list. */
+#define TARGET_ROBUST_LIST_LIMIT 2048
+
+/*
+ * Read one guest robust_list pointer at address @uaddr, split off the low bit
+ * (the PI marker) as *pi, and return the (bit-cleared) pointer in *entry.
+ * Returns -1 on a faulting read, mirroring the kernel's fetch_robust_entry().
+ */
+static int fetch_robust_entry(abi_ulong *entry, abi_ulong uaddr, bool *pi)
+{
+    abi_ulong val;
+
+    if (get_user_ual(val, uaddr)) {
+        return -1;
+    }
+    *entry = val & ~(abi_ulong)1;
+    *pi = val & 1;
+    return 0;
+}
+
+/*
+ * Emulate the kernel's handle_futex_death() for one robust-list futex owned by
+ * the dying guest thread @tid: flag the word FUTEX_OWNER_DIED (keeping
+ * FUTEX_WAITERS) and wake a waiter, so another thread's robust mutex lock
+ * returns EOWNERDEAD instead of hanging forever. The guest word is directly
+ * host-accessible via g2h(); it is stored target-endian, so the atomic
+ * compare-exchange swaps around tswap32().
+ */
+static void handle_futex_death(CPUState *cpu, abi_ulong uaddr,
+                               uint32_t tid, bool pi, bool pending_op)
+{
+    uint32_t uval, mval, prev;
+
+    if (uaddr & (sizeof(uint32_t) - 1)) {
+        return;
+    }
+retry:
+    if (get_user_u32(uval, uaddr)) {
+        return;
+    }
+
+    /*
+     * A pending-op entry may still hold 0 if set_robust_list_pending ran but
+     * the lock did not complete; just wake any waiter and stop.
+     */
+    if (pending_op && !pi && !uval) {
+        do_sys_futex(g2h(cpu, uaddr), FUTEX_WAKE, 1, NULL, NULL, 0);
+        return;
+    }
+
+    if ((uval & TARGET_FUTEX_TID_MASK) != tid) {
+        return;
+    }
+
+    mval = (uval & TARGET_FUTEX_WAITERS) | TARGET_FUTEX_OWNER_DIED;
+    prev = tswap32(qatomic_cmpxchg((uint32_t *)g2h(cpu, uaddr),
+                                   tswap32(uval), tswap32(mval)));
+    if (prev != uval) {
+        goto retry;
+    }
+
+    /* PI futexes are handed off by the flag alone; only wake plain waiters. */
+    if (!pi && (uval & TARGET_FUTEX_WAITERS)) {
+        do_sys_futex(g2h(cpu, uaddr), FUTEX_WAKE, 1, NULL, NULL, 0);
+    }
+}
+
+/*
+ * Walk the calling thread's registered robust futex list at guest thread/
+ * process exit and release each held futex, emulating the kernel's
+ * exit_robust_list(). No-op when no list was registered. This is why
+ * set_robust_list() is emulated rather than returning ENOSYS.
+ */
+void target_exit_robust_list(CPUState *cpu)
+{
+    TaskState *ts = get_task_state(cpu);
+    abi_ulong head = ts->robust_list_head;
+    abi_ulong entry, next_entry, pending;
+    abi_ulong futex_offset;
+    bool pi, pip, next_pi;
+    unsigned int limit = TARGET_ROBUST_LIST_LIMIT;
+    int rc;
+
+    if (!head || ts->robust_list_len != 3 * sizeof(abi_ulong)) {
+        return;
+    }
+
+    /* head->list.next */
+    if (fetch_robust_entry(&entry, head, &pi)) {
+        return;
+    }
+    /* head->futex_offset */
+    if (get_user_ual(futex_offset, head + sizeof(abi_ulong))) {
+        return;
+    }
+    /* head->list_op_pending */
+    if (fetch_robust_entry(&pending, head + 2 * sizeof(abi_ulong), &pip)) {
+        return;
+    }
+
+    while (entry != head) {
+        /* Read the next pointer before we touch this entry's futex. */
+        rc = fetch_robust_entry(&next_entry, entry, &next_pi);
+        if (entry != pending) {
+            handle_futex_death(cpu, entry + futex_offset,
+                               ts->ts_tid, pi, false);
+        }
+        if (rc) {
+            return;
+        }
+        entry = next_entry;
+        pi = next_pi;
+        if (!--limit) {
+            break;
+        }
+    }
+
+    if (pending) {
+        handle_futex_death(cpu, pending + futex_offset,
+                           ts->ts_tid, pip, true);
+    }
+}
+
 #if defined(TARGET_NR_name_to_handle_at) && defined(CONFIG_OPEN_BY_HANDLE)
 #ifndef AT_HANDLE_MNT_ID_UNIQUE
 #define AT_HANDLE_MNT_ID_UNIQUE 0x001
@@ -9792,6 +9919,9 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 
         if (CPU_NEXT(first_cpu)) {
             TaskState *ts = get_task_state(cpu);
+
+            /* Release this thread's robust futexes before it disappears. */
+            target_exit_robust_list(cpu);
 
             if (ts->child_tidptr) {
                 put_user_u32(0, ts->child_tidptr);
@@ -13549,20 +13679,45 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
 
 #ifdef TARGET_NR_set_robust_list
     case TARGET_NR_set_robust_list:
-    case TARGET_NR_get_robust_list:
-        /* The ABI for supporting robust futexes has userspace pass
-         * the kernel a pointer to a linked list which is updated by
-         * userspace after the syscall; the list is walked by the kernel
-         * when the thread exits. Since the linked list in QEMU guest
-         * memory isn't a valid linked list for the host and we have
-         * no way to reliably intercept the thread-death event, we can't
-         * support these. Silently return ENOSYS so that guest userspace
-         * falls back to a non-robust futex implementation (which should
-         * be OK except in the corner case of the guest crashing while
-         * holding a mutex that is shared with another process via
-         * shared memory).
+    {
+        /*
+         * Record the guest's robust-futex list head per thread. We do NOT
+         * forward it to the host: the guest chain is laid out for the target
+         * ABI, so handing it to the host kernel would make it walk garbage on
+         * thread death. Storing it (and echoing it from get_robust_list) is
+         * enough for guests that merely require the syscall to succeed - e.g.
+         * steamclient.so aborts hard ("futex robust_list not initialized by
+         * pthreads") if set_robust_list returns ENOSYS. The kernel requires
+         * len == sizeof(struct robust_list_head), which is 3 target words.
+         *
+         * The list is walked at thread/process exit by
+         * target_exit_robust_list() to release still-held robust futexes
+         * (FUTEX_OWNER_DIED), so a peer's robust mutex lock returns
+         * EOWNERDEAD rather than hanging.
          */
-        return -TARGET_ENOSYS;
+        TaskState *ts = get_task_state(cpu);
+        if (arg2 != 3 * sizeof(abi_ulong)) {
+            return -TARGET_EINVAL;
+        }
+        ts->robust_list_head = arg1;
+        ts->robust_list_len = arg2;
+        return 0;
+    }
+    case TARGET_NR_get_robust_list:
+    {
+        /* arg1=pid (0/self only), arg2=*head_ptr (out), arg3=*len_ptr (out). */
+        TaskState *ts = get_task_state(cpu);
+        if (arg1 != 0 && arg1 != ts->ts_tid) {
+            return -TARGET_EPERM;
+        }
+        if (put_user_ual(ts->robust_list_head, arg2)) {
+            return -TARGET_EFAULT;
+        }
+        if (put_user_ual(ts->robust_list_len, arg3)) {
+            return -TARGET_EFAULT;
+        }
+        return 0;
+    }
 #endif
 
 #if defined(TARGET_NR_utimensat)

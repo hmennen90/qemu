@@ -123,6 +123,14 @@ struct TaskState {
     target_ulong orig_ax;
 #endif
     abi_ulong child_tidptr;
+    /*
+     * Robust futex list registered by the guest via set_robust_list().
+     * Stored per-thread and echoed back by get_robust_list(); the head is a
+     * guest address into a guest-native robust_list_head chain. robust_list_len
+     * is 0 until the guest registers a list (see linux-user/syscall.c).
+     */
+    abi_ulong robust_list_head;
+    abi_ulong robust_list_len;
 #ifdef TARGET_M68K
     abi_ulong tp_value;
 #endif

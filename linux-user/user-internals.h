@@ -178,6 +178,15 @@ static inline int regpairs_aligned(CPUArchState *cpu_env, int num) { return 0; }
 void preexit_cleanup(CPUArchState *env, int code);
 
 /**
+ * target_exit_robust_list: release the calling thread's robust futexes
+ *
+ * Walks the robust futex list the guest registered via set_robust_list() and
+ * flags each still-held futex FUTEX_OWNER_DIED, waking a waiter. Called at
+ * thread and process exit; a no-op if no list was registered.
+ */
+void target_exit_robust_list(CPUState *cpu);
+
+/**
  * begin_parallel_context
  * @cs: the CPU context
  *

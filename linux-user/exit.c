@@ -32,6 +32,11 @@ void preexit_cleanup(CPUArchState *env, int code)
 #ifdef CONFIG_GCOV
         __gcov_dump();
 #endif
+        /*
+         * Release robust futexes held by the exiting thread (exit_group, the
+         * final thread's exit, or a fatal signal all funnel through here).
+         */
+        target_exit_robust_list(env_cpu(env));
         gdb_exit(code);
         qemu_plugin_user_exit();
         perf_exit();
